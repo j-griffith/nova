@@ -29,9 +29,11 @@ import paramiko
 import random
 import socket
 import string
+import time
 import uuid
 from xml.etree import ElementTree
 
+from nova import context
 from nova import exception
 from nova import flags
 from nova import log as logging
@@ -804,7 +806,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         LOG.debug(_("Enter SolidFire create_volume..."))
         GB = 1048576 * 1024
         slice_count = 1
-        enable_emulation = False
+        enable_emulation = True
         attributes = {}
 
         cluster_info = self._get_cluster_info()
@@ -832,7 +834,9 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         iqn = None
         for v in volume_list:
             if v['volumeID'] == volume_id:
-                iqn = 'iqn.2010-01.com.solidfire:' + v['iqn']
+                # Fixed Bug CB
+                # iqn = 'iqn.2010-01.com.solidfire:' + v['iqn']
+                iqn = v['iqn']
                 break
 
         model_update = {}
@@ -894,3 +898,90 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
     def create_export(self, context, volume):
         LOG.debug(_("Executing SolidFire create_export..."))
         return self._do_export(volume)
+
+    def _do_create_snapshot(self, snapshot, snapshot_name):
+        """Creates a snapshot."""
+        LOG.debug(_("Enter SolidFire create_snapshot..."))
+        sf_account_name = socket.gethostname() + '-' + snapshot['project_id']
+        sfaccount = self._get_sfaccount_by_name(sf_account_name)
+        if sfaccount is None:
+            raise exception.SfAccountNotFound(account_name=sf_account_name)
+
+        params = {'accountID': sfaccount['accountID']}
+        data = self._issue_api_request('ListVolumesForAccount', params)
+        if 'result' not in data:
+            raise exception.SolidFireAPIDataException(data=data)
+
+        ctxt = context.get_admin_context()
+        vol_ref = self.db.volume_get(ctxt, snapshot['volume_id'])
+
+        found_count = 0
+        volid = -1
+
+        volname = FLAGS.volume_name_template % snapshot['volume_id']
+        for v in data['result']['volumes']:
+            if v['name'] == volname:
+                found_count += 1
+                volid = v['volumeID']
+
+        if found_count == 0:
+            raise exception.VolumeNotFound(volume_id=snapshot['volume_id'])
+        if found_count != 1:
+            raise exception.DuplicateSfVolumeNames(
+                vol_name=(FLAGS.volume_name_template % snapshot['volume_id']))
+
+        params = {'volumeID': int(volid),
+                  'name': snapshot_name,
+                  'attributes': {'OriginatingVolume': volid}}
+
+        data = self._issue_api_request('CloneVolume', params)
+        if 'result' not in data:
+            raise exception.SolidFireAPIDataException(data=data)
+
+        return (data, sfaccount)
+
+    def create_snapshot(self, snapshot):
+        LOG.debug(_("Enter SolidFire create_snapshot..."))
+        snapshot_name = (FLAGS.snapshot_name_template %
+                         snapshot['id'])
+        (data, sf_account) = self._do_create_snapshot(snapshot, snapshot_name)
+
+    def create_volume_from_snapshot(self, volume, snapshot):
+        cluster_info = self._get_cluster_info()
+        iscsi_portal = cluster_info['clusterInfo']['svip'] + ':3260'
+        sfaccount = self._create_sfaccount(snapshot['project_id'])
+        chap_secret = sfaccount['targetSecret']
+        snapshot_name = FLAGS.volume_name_template % volume['id']
+
+        (data, sf_account) = self._do_create_snapshot(snapshot, snapshot_name)
+
+        if 'result' not in data or 'volumeID' not in data['result']:
+            raise exception.SolidFireAPIDataException(data=data)
+
+        volume_id = data['result']['volumeID']
+
+        iqn = None
+        while iqn is None:
+            volume_list = self._get_volumes_by_sfaccount(sf_account['accountID'])
+            for v in volume_list:
+                if v['volumeID'] == volume_id:
+                    LOG.debug(_("matched internal id: %s") % volume_id)
+                    iqn = v['iqn']
+                    if iqn is None:
+                        LOG.warning(_("Matched, but IQN wasn't set, "
+                                      "requerie in 1 second..."))
+                        time.sleep(1)
+                    break
+
+        model_update = {}
+
+        # NOTE(john-griffith): SF volumes are always at lun 0
+        model_update['provider_location'] = ('%s %s %s'
+                                             % (iscsi_portal, iqn, 0))
+        model_update['provider_auth'] = ('CHAP %s %s'
+                                         % (sfaccount['username'],
+                                            chap_secret))
+        return model_update
+
+    def delete_snapshot(self, snapshot):
+        self.delete_volume(snapshot)
