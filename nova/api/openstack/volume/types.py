@@ -18,6 +18,7 @@
 """ The volume type & volume types extra specs extension"""
 
 from webob import exc
+import webob
 
 from nova.api.openstack import wsgi
 from nova.api.openstack import xmlutil
@@ -51,6 +52,9 @@ class VolumeTypesTemplate(xmlutil.TemplateBuilder):
 class VolumeTypesController(object):
     """ The volume types API controller for the OpenStack API """
 
+    def __init__(self):
+        super(VolumeTypesController, self).__init__()
+
     @wsgi.serializers(xml=VolumeTypesTemplate)
     def index(self, req):
         """ Returns the list of volume types """
@@ -71,6 +75,49 @@ class VolumeTypesController(object):
         vol_type['id'] = str(vol_type['id'])
         return {'volume_type': vol_type}
 
+    @wsgi.serializers(xml=VolumeTypeTemplate)
+    def create(self, req, body):
+        """Creates a new type."""
+        context = req.environ['nova.context']
+
+        if not body:
+            return exc.HTTPUnprocessableEntity()
+        vol_type = body.get('volume_type', None)
+        if vol_type is None or vol_type == "":
+            raise exc.HTTPUnprocessableEntity()
+
+        name = vol_type.get('name', None)
+        specs = vol_type.get('extra_specs', {})
+
+        if name is None or name == "":
+            raise exc.HTTPUnprocessableEntity()
+
+        try:
+            volume_types.create(context, name, specs)
+            vol_type = volume_types.get_volume_type_by_name(context, name)
+        except exception.QuotaError as error:
+            self._handle_quota_error(error)
+        except exception.NotFound:
+            raise exc.HTTPNotFound()
+
+        return {'volume_type': vol_type}
+
+    @wsgi.serializers(xml=VolumeTypeTemplate)
+    def delete(self, req, id):
+        isstring = False
+        if isinstance(id, basestring):
+            isstring = True
+        context = req.environ['nova.context']
+        if id is None or id == "":
+            raise exc.HTTPUnprocessableEntity()
+
+        try:
+            volume_types.destroy(context, id)
+        except exception.QuotaError as error:
+            self._handle_quota_error(error)
+        except exception.NotFound:
+            raise exc.HTTPNotFound()
+        return webob.Response(status_int=202)
 
 def create_resource():
     return wsgi.Resource(VolumeTypesController())

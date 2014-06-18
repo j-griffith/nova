@@ -39,6 +39,7 @@ from nova import flags
 from nova import log as logging
 from nova.openstack.common import cfg
 from nova import utils
+from nova.volume import volume_types
 import nova.volume.driver
 
 
@@ -784,6 +785,20 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         char_set = string.ascii_uppercase + string.digits
         return ''.join(random.sample(char_set, length))
 
+    def _set_qos_by_volume_type(self, ctxt, type_id):
+        qos = {}
+        volume_type = volume_types.get_volume_type(ctxt, type_id)
+        specs = volume_type.get('extra_specs')
+
+        kvs = specs
+        for key, value in kvs.iteritems():
+            if ':' in key:
+                fields = key.split(':')
+                key = fields[1]
+            if key in self.sf_qos_keys:
+                qos[key] = int(value)
+        return qos
+
     def create_volume(self, volume):
         """Create volume on SolidFire device.
 
@@ -815,6 +830,11 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         account_id = sfaccount['accountID']
         account_name = sfaccount['username']
         chap_secret = sfaccount['targetSecret']
+
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        if type_id is not None:
+            qos = self._set_qos_by_volume_type(ctxt, type_id)
 
         params = {'name': volume['name'],
                   'accountID': account_id,
@@ -985,3 +1005,6 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
     def delete_snapshot(self, snapshot):
         self.delete_volume(snapshot)
+
+    def replicate_volume(self, volume):
+        pass
