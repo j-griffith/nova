@@ -74,6 +74,19 @@ san_opts = [
     cfg.StrOpt('san_zfs_volume_base',
                default='rpool/',
                help='The ZFS path under which to create zvols for volumes.'),
+    cfg.StrOpt('sf_api_port',
+               default=443,
+               help='SolidFire API prot.  Useful if device API is behind '
+                    'a proxy on a different port.'),
+    cfg.StrOpt('sf_replication_key',
+               default='replication',
+               help='Scoping indicator for extra-specs key '
+                    'containing replication info '
+                    '(replication:rmvip=<remove-mvip>'),
+    cfg.StrOpt('sf_qos_key',
+               default='qos',
+               help='Scoping indicator for extra-specs key '
+                    'containing qos info (qos:minIOPS=nnn)'),
     ]
 
 FLAGS = flags.FLAGS
@@ -97,7 +110,7 @@ class SanISCSIDriver(nova.volume.driver.ISCSIDriver):
 
     def _connect_to_ssh(self):
         ssh = paramiko.SSHClient()
-        #TODO(justinsb): We need a better SSH key policy
+        # TODO(justinsb): We need a better SSH key policy
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         if FLAGS.san_password:
             ssh.connect(FLAGS.san_ip,
@@ -539,13 +552,13 @@ class HpSanISCSIDriver(SanISCSIDriver):
             volume_attributes["volume." + k] = v
 
         status_node = volume_node.find("status")
-        if not status_node is None:
+        if status_node is not None:
             for k, v in status_node.attrib.items():
                 volume_attributes["status." + k] = v
 
         # We only consider the first permission node
         permission_node = volume_node.find("permission")
-        if not permission_node is None:
+        if permission_node is not None:
             for k, v in status_node.attrib.items():
                 volume_attributes["permission." + k] = v
 
@@ -628,7 +641,7 @@ class HpSanISCSIDriver(SanISCSIDriver):
             else:
                 msg = (_("Could not determine project for volume %s, "
                          "can't export") %
-                         (volume['name']))
+                       (volume['name']))
                 if force_create:
                     raise exception.Error(msg)
                 else:
@@ -658,7 +671,9 @@ class HpSanISCSIDriver(SanISCSIDriver):
 
 class SolidFireSanISCSIDriver(SanISCSIDriver):
 
-    def _issue_api_request(self, method_name, params):
+    sf_qos_keys = ['minIOPS', 'maxIOPS', 'burstIOPS']
+
+    def _issue_api_request(self, method_name, params, version='1.0'):
         """All API requests to SolidFire device go through this method
 
         Simple json-rpc web based API calls.
@@ -667,8 +682,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         """
 
         host = FLAGS.san_ip
-        # For now 443 is the only port our server accepts requests on
-        port = 443
+        port = FLAGS.sf_api_port
 
         # NOTE(john-griffith): Probably don't need this, but the idea is
         # we provide a request_id so we can correlate
@@ -697,8 +711,10 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
             header['Authorization'] = 'Basic %s' % auth_key
 
         LOG.debug(_("Payload for SolidFire API call: %s") % payload)
+
+        api_endpoint = '/json-rpc/%s' % version
         connection = httplib.HTTPSConnection(host, port)
-        connection.request('POST', '/json-rpc/1.0', payload, header)
+        connection.request('POST', api_endpoint, payload, header)
         response = connection.getresponse()
         data = {}
 
@@ -774,8 +790,9 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         sfaccount = self._get_sfaccount_by_name(sfaccount_name)
 
         model_update = {}
-        model_update['provider_auth'] = ('CHAP %s %s'
-                % (sfaccount['username'], sfaccount['targetSecret']))
+        model_update['provider_auth'] =\
+            ('CHAP %s %s'
+             % (sfaccount['username'], sfaccount['targetSecret']))
 
         return model_update
 
@@ -786,18 +803,33 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         return ''.join(random.sample(char_set, length))
 
     def _set_qos_by_volume_type(self, ctxt, type_id):
+        qos_scope = FLAGS.sf_qos_key
         qos = {}
         volume_type = volume_types.get_volume_type(ctxt, type_id)
         specs = volume_type.get('extra_specs')
 
         kvs = specs
         for key, value in kvs.iteritems():
-            if ':' in key:
+            if qos_scope in key:
                 fields = key.split(':')
                 key = fields[1]
             if key in self.sf_qos_keys:
                 qos[key] = int(value)
         return qos
+
+    def _set_replication_by_volume_type(self, ctxt, type_id):
+        replication_scope = FLAGS.sf_replication_key
+        rep_data = {}
+        volume_type = volume_types.get_volume_type(ctxt, type_id)
+        specs = volume_type.get('extra_specs')
+
+        kvs = specs
+        for key, value in kvs.iteritems():
+            if replication_scope in key:
+                fields = key.split(':')
+                key = fields[1]
+        # TODO (JDG): Add a validity check against keys
+        return rep_data
 
     def create_volume(self, volume):
         """Create volume on SolidFire device.
@@ -823,6 +855,9 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         slice_count = 1
         enable_emulation = True
         attributes = {}
+        qos = {}
+        replicate_volume = False
+        replication_target = None
 
         cluster_info = self._get_cluster_info()
         iscsi_portal = cluster_info['clusterInfo']['svip'] + ':3260'
@@ -830,18 +865,31 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         account_id = sfaccount['accountID']
         account_name = sfaccount['username']
         chap_secret = sfaccount['targetSecret']
+        cluster_id = cluster_info['clusterInfo']['uniqueID']
 
         ctxt = context.get_admin_context()
         type_id = volume['volume_type_id']
+
         if type_id is not None:
             qos = self._set_qos_by_volume_type(ctxt, type_id)
+            replication = self._set_replication_by_volume_type(ctxt, type_id)
 
+        if qos:
+            for k, v in qos.items():
+                attributes[k] = str(v)
+
+        attributes['project_id'] = volume['project_id']
+        attributes['replicated'] = replicate_volume
+        attributes['replication_target'] = replication_target
+
+        vol_name = '%s.%s' % (volume['name'], cluster_id)
         params = {'name': volume['name'],
                   'accountID': account_id,
                   'sliceCount': slice_count,
                   'totalSize': volume['size'] * GB,
                   'enable512e': enable_emulation,
-                  'attributes': attributes}
+                  'attributes': attributes,
+                  'qos': qos}
 
         data = self._issue_api_request('CreateVolume', params)
 
@@ -862,10 +910,12 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         model_update = {}
 
         # NOTE(john-griffith): SF volumes are always at lun 0
-        model_update['provider_location'] = ('%s %s %s'
-                % (iscsi_portal, iqn, 0))
-        model_update['provider_auth'] = ('CHAP %s %s'
-                % (account_name, chap_secret))
+        model_update['provider_location'] =\
+            ('%s %s %s'
+             % (iscsi_portal, iqn, 0))
+        model_update['provider_auth'] =\
+            ('CHAP %s %s'
+             % (account_name, chap_secret))
 
         LOG.debug(_("Leaving SolidFire create_volume"))
         return model_update
@@ -900,7 +950,11 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                 found_count += 1
                 volid = v['volumeID']
 
-        if found_count != 1:
+        if found_count == 0:
+            LOG.warning(_("Failed to find volume on SolidFire "
+                          "Cluster for delete..."))
+
+        if found_count > 1:
             LOG.debug(_("Deleting volumeID: %s ") % volid)
             raise exception.DuplicateSfVolumeNames(vol_name=volume['name'])
 
@@ -982,7 +1036,8 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
         iqn = None
         while iqn is None:
-            volume_list = self._get_volumes_by_sfaccount(sf_account['accountID'])
+            volume_list = \
+                self._get_volumes_by_sfaccount(sf_account['accountID'])
             for v in volume_list:
                 if v['volumeID'] == volume_id:
                     LOG.debug(_("matched internal id: %s") % volume_id)
