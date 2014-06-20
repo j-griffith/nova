@@ -673,7 +673,14 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
     sf_qos_keys = ['minIOPS', 'maxIOPS', 'burstIOPS']
 
-    def _issue_api_request(self, method_name, params, version='1.0'):
+    def _validate_api_response(self, payload):
+        if 'result' not in payload:
+            raise exception.SolidFireAPIDataException(data=payload)
+        return payload['result']
+
+    def _issue_api_request(self, method_name,
+                           params, version='1.0',
+                           **cluster_creds):
         """All API requests to SolidFire device go through this method
 
         Simple json-rpc web based API calls.
@@ -681,16 +688,20 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         and returns results in a dict as well.
         """
 
-        host = FLAGS.san_ip
-        port = FLAGS.sf_api_port
+        # TODO: We have this silly "issue_api_req, check for results in data
+        # in each call we make.  Later versions moved this into the issue_api
+        # method itself.  Somebody should do that here, or create a new
+        # _validate_data method
+
+        host = cluster_creds.get('mvip', FLAGS.san_ip)
+        port = cluster_creds.get('api_port', FLAGS.sf_api_port)
+        cluster_admin = cluster_creds.get('login', FLAGS.san_login)
+        cluster_password = cluster_creds.get('password', FLAGS.san_password)
 
         # NOTE(john-griffith): Probably don't need this, but the idea is
         # we provide a request_id so we can correlate
         # responses with requests
         request_id = int(uuid.uuid4())  # just generate a random number
-
-        cluster_admin = FLAGS.san_login
-        cluster_password = FLAGS.san_password
 
         command = {'method': method_name,
                    'id': request_id}
@@ -778,10 +789,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
     def _get_cluster_info(self):
         params = {}
         data = self._issue_api_request('GetClusterInfo', params)
-        if 'result' not in data:
-            raise exception.SolidFireAPIDataException(data=data)
-
-        return data['result']
+        return self._validate_api_response(data)
 
     def _do_export(self, volume):
         """Gets the associated account, retrieves CHAP info and updates."""
@@ -830,6 +838,55 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                 key = fields[1]
         # TODO (JDG): Add a validity check against keys
         return rep_data
+
+    def _create_cluster_pairing(self, remote_cluster):
+        params = {}
+        data = self._issue_api_request('StartClusterPairing',
+                                       params,
+                                       version='6.0')
+        results = self._validate_api_response(data)
+        cluster_pair_id = results['clusterPairID']
+        params['clusterPairingKey'] = results['clusterPairingKey']
+        data = self._issue_api_request('CompleteClusterPairing',
+                                       params,
+                                       version='6.0',
+                                       **remote_cluster)
+        result = self._validate_api_response(data)
+        # FIXME (jdg): For compat reasons should probably
+        # do a list and ret the whole object
+        # cuz caller looks in list, if it finds
+        # it that's what it works off of, if
+        # it doesn't it calls this create pairing
+        return result['clusterPairID']
+
+    def _get_cluster_pair_list(self, cluster_data=None):
+        # takes a dict of cluster info (cluster to querie)
+        # returns a list of pair items (dicts)
+        params = {}
+        data = self._issue_api_request('ListClusterPairs',
+                                       params,
+                                       version='6.0')
+        result = self._validate_api_response(data)
+        return result['clusterPairs']
+
+    def _check_enable_cluster_pairing(self, rep_data):
+        params = {}
+        pair_info = {}
+        pair_list = self._get_cluster_pair_list()
+        for pair in pair_list:
+            if (pair['mvip'] == rep_data['mvip']) and\
+                    (pair['status'] == "Connected"):
+                pair_info = pair
+                break
+
+        if not pair_info:
+            self._create_cluster_pairing(rep_data)
+
+    def _replicate_volume(self, volume, remote_cluster_info):
+        pass
+
+    def _configure_replication():
+        pass
 
     def create_volume(self, volume):
         """Create volume on SolidFire device.
@@ -892,11 +949,9 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                   'qos': qos}
 
         data = self._issue_api_request('CreateVolume', params)
+        result = self._validate_api_response(data)
 
-        if 'result' not in data or 'volumeID' not in data['result']:
-            raise exception.SolidFireAPIDataException(data=data)
-
-        volume_id = data['result']['volumeID']
+        volume_id = result['volumeID']
 
         volume_list = self._get_volumes_by_sfaccount(account_id)
         iqn = None
@@ -940,12 +995,11 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
         params = {'accountID': sfaccount['accountID']}
         data = self._issue_api_request('ListVolumesForAccount', params)
-        if 'result' not in data:
-            raise exception.SolidFireAPIDataException(data=data)
+        result = self._validate_api_response(data)
 
         found_count = 0
         volid = -1
-        for v in data['result']['volumes']:
+        for v in result['volumes']:
             if v['name'] == volume['name']:
                 found_count += 1
                 volid = v['volumeID']
@@ -960,8 +1014,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
         params = {'volumeID': volid}
         data = self._issue_api_request('DeleteVolume', params)
-        if 'result' not in data:
-            raise exception.SolidFireAPIDataException(data=data)
+        self._validate_api_response(data)
 
         LOG.debug(_("Leaving SolidFire delete_volume"))
 
@@ -983,8 +1036,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
         params = {'accountID': sfaccount['accountID']}
         data = self._issue_api_request('ListVolumesForAccount', params)
-        if 'result' not in data:
-            raise exception.SolidFireAPIDataException(data=data)
+        result = self._validate_api_response(data)
 
         ctxt = context.get_admin_context()
         vol_ref = self.db.volume_get(ctxt, snapshot['volume_id'])
@@ -993,7 +1045,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         volid = -1
 
         volname = FLAGS.volume_name_template % snapshot['volume_id']
-        for v in data['result']['volumes']:
+        for v in result['volumes']:
             if v['name'] == volname:
                 found_count += 1
                 volid = v['volumeID']
@@ -1009,10 +1061,9 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                   'attributes': {'OriginatingVolume': volid}}
 
         data = self._issue_api_request('CloneVolume', params)
-        if 'result' not in data:
-            raise exception.SolidFireAPIDataException(data=data)
+        result = self._validate_api_response(data)
 
-        return (data, sfaccount)
+        return (result, sfaccount)
 
     def create_snapshot(self, snapshot):
         LOG.debug(_("Enter SolidFire create_snapshot..."))
