@@ -81,8 +81,7 @@ san_opts = [
     cfg.StrOpt('sf_replication_key',
                default='replication',
                help='Scoping indicator for extra-specs key '
-                    'containing replication info '
-                    '(replication:rmvip=<remove-mvip>'),
+                    'containing replication info '),
     cfg.StrOpt('sf_qos_key',
                default='qos',
                help='Scoping indicator for extra-specs key '
@@ -754,16 +753,16 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         if 'result' in data:
             return data['result']['volumes']
 
-    def _get_sfaccount_by_name(self, sf_account_name):
+    def _get_sfaccount_by_name(self, sf_account_name, **kwargs):
         sfaccount = None
         params = {'username': sf_account_name}
-        data = self._issue_api_request('GetAccountByName', params)
+        data = self._issue_api_request('GetAccountByName', params, version='1.0', **kwargs)
         if 'result' in data and 'account' in data['result']:
             LOG.debug(_('Found solidfire account: %s') % sf_account_name)
             sfaccount = data['result']['account']
         return sfaccount
 
-    def _create_sfaccount(self, nova_project_id):
+    def _create_sfaccount(self, nova_project_id, **cluster_creds):
         """Create account on SolidFire device if it doesn't already exist.
 
         We're first going to check if the account already exits, if it does
@@ -771,7 +770,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         """
 
         sf_account_name = socket.gethostname() + '-' + nova_project_id
-        sfaccount = self._get_sfaccount_by_name(sf_account_name)
+        sfaccount = self._get_sfaccount_by_name(sf_account_name, **cluster_creds)
         if sfaccount is None:
             LOG.debug(_('solidfire account: %s does not exist, create it...')
                       % sf_account_name)
@@ -782,13 +781,13 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                       'attributes': {}}
             data = self._issue_api_request('AddAccount', params)
             if 'result' in data:
-                sfaccount = self._get_sfaccount_by_name(sf_account_name)
+                sfaccount = self._get_sfaccount_by_name(sf_account_name, **cluster_creds)
 
         return sfaccount
 
-    def _get_cluster_info(self):
+    def _get_cluster_info(self, **kwargs):
         params = {}
-        data = self._issue_api_request('GetClusterInfo', params)
+        data = self._issue_api_request('GetClusterInfo', params, version='1.0', **kwargs)
         return self._validate_api_response(data)
 
     def _do_export(self, volume):
@@ -825,7 +824,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                 qos[key] = int(value)
         return qos
 
-    def _set_replication_by_volume_type(self, ctxt, type_id):
+    def _get_replication_by_volume_type(self, ctxt, type_id):
         replication_scope = FLAGS.sf_replication_key
         rep_data = {}
         volume_type = volume_types.get_volume_type(ctxt, type_id)
@@ -835,8 +834,8 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         for key, value in kvs.iteritems():
             if replication_scope in key:
                 fields = key.split(':')
-                key = fields[1]
-        # TODO (JDG): Add a validity check against keys
+                rep_data[key] = fields[1]
+
         return rep_data
 
     def _create_cluster_pairing(self, remote_cluster):
@@ -882,13 +881,37 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         if not pair_info:
             self._create_cluster_pairing(rep_data)
 
-    def _replicate_volume(self, volume, remote_cluster_info):
-        pass
+    def _create_volume_pairing(self, source_id, dest_id, replication_info):
+        params = {'volumeID': source_id}
+        data = self._issue_api_request('StartVolumePairing',
+                                       params,
+                                       version='6.0')
+        result = self._validate_api_response(data)
 
-    def _configure_replication():
-        pass
+        params = {'volumeID': dest_id,
+                  'volumePairingKey': result['volumePairingKey']}
+        data = self._issue_api_request('CompleteVolumePairing',
+                                       params,
+                                       version='6.0',
+                                       **replication_info)
+        result = self._validate_api_response(data)
 
-    def create_volume(self, volume):
+    def _replicate_volume_with_create(self, volume, source_id, replication_info):
+        # First we create the destination volume on the specified cluster
+
+        # Things we expect in replication_info:
+        #   {'mvip': 'ip-addr',
+        #    'api_port': 'api_port',
+        #    'login': 'login-to-mvip',
+        #    'password': 'password'}
+
+        # BOOKMARK
+        secondary_model = self.create_volume(volume, True, replication_info)
+        self._check_enable_cluster_pairing(replication_info)
+        self._create_volume_pairing(source_id, dest_id, replication_info)
+
+
+    def create_volume(self, volume, ignore_replication_types=False, **cluster_creds):
         """Create volume on SolidFire device.
 
         The account is where CHAP settings are derived from, volume is
@@ -913,12 +936,12 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         enable_emulation = True
         attributes = {}
         qos = {}
+        replication_info = {}
         replicate_volume = False
-        replication_target = None
 
-        cluster_info = self._get_cluster_info()
+        cluster_info = self._get_cluster_info(**cluster_creds)
         iscsi_portal = cluster_info['clusterInfo']['svip'] + ':3260'
-        sfaccount = self._create_sfaccount(volume['project_id'])
+        sfaccount = self._create_sfaccount(volume['project_id'], **cluster_creds)
         account_id = sfaccount['accountID']
         account_name = sfaccount['username']
         chap_secret = sfaccount['targetSecret']
@@ -929,15 +952,16 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
 
         if type_id is not None:
             qos = self._set_qos_by_volume_type(ctxt, type_id)
-            replication = self._set_replication_by_volume_type(ctxt, type_id)
+            if not ignore_replication_types:
+                replication_info  = \
+                self._get_replication_by_volume_type(ctxt, type_id)
 
         if qos:
             for k, v in qos.items():
                 attributes[k] = str(v)
 
         attributes['project_id'] = volume['project_id']
-        attributes['replicated'] = replicate_volume
-        attributes['replication_target'] = replication_target
+        attributes['replicated'] = True if replication_info else False
 
         vol_name = '%s.%s' % (volume['name'], cluster_id)
         params = {'name': volume['name'],
@@ -948,7 +972,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                   'attributes': attributes,
                   'qos': qos}
 
-        data = self._issue_api_request('CreateVolume', params)
+        data = self._issue_api_request('CreateVolume', params, version='1.0', **cluster_creds)
         result = self._validate_api_response(data)
 
         volume_id = result['volumeID']
@@ -963,6 +987,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                 break
 
         model_update = {}
+        model_update['secondaries'] = []
 
         # NOTE(john-griffith): SF volumes are always at lun 0
         model_update['provider_location'] =\
@@ -971,6 +996,17 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         model_update['provider_auth'] =\
             ('CHAP %s %s'
              % (account_name, chap_secret))
+
+        if replication_info:
+            alt_model = self._replicate_volume_with_create(volume,
+                                                           volume_id,
+                                                           replication_info)
+
+            # First add the source vol info to the returned secondary
+            alt_model['secondaries'].append(model_update)
+
+            # Now add the secondary provider info to the primary
+            model_update['secondaries'].append(alt_model)
 
         LOG.debug(_("Leaving SolidFire create_volume"))
         return model_update
