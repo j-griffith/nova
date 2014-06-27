@@ -1043,6 +1043,40 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         LOG.debug(_("Leaving SolidFire create_volume"))
         return model_update
 
+    def _delete_replication_volume(self, volume,
+                                   sfaccount, **replication_info):
+        """ Deletes replication target volume."""
+        # TODO(JDG): Refactor this to a general delete call
+        # that we can share between the "regular" delete volume method
+
+        params = {'accountID': sfaccount['accountID']}
+        data = self._issue_api_request('ListVolumesForAccount',
+                                       params,
+                                       **replication_info)
+        result = self._validate_api_response(data)
+
+        found_count = 0
+        volid = -1
+        for v in result['volumes']:
+            if v['name'] == volume['name'] + "-secondary":
+                found_count += 1
+                volid = v['volumeID']
+
+        if found_count == 0:
+            LOG.warning(_("Failed to find replicated volume on SolidFire "
+                          "Cluster for delete..."))
+
+        if found_count > 1:
+            LOG.debug(_("Deleting volumeID: %s ") % volid)
+            raise exception.DuplicateSfVolumeNames(vol_name=volume['name'])
+
+        params = {'volumeID': volid}
+        data = self._issue_api_request('DeleteVolume', params,
+                                       version='1.0', **replication_info)
+        self._validate_api_response(data)
+
+        LOG.debug(_("Leaving SolidFire delete_replication_volume"))
+
     def delete_volume(self, volume):
         """Delete SolidFire Volume from device.
 
@@ -1060,6 +1094,17 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         sfaccount = self._get_sfaccount_by_name(sf_account_name)
         if sfaccount is None:
             raise exception.SfAccountNotFound(account_name=sf_account_name)
+
+        # Check to see if we need to delete a replication target
+        ctxt = context.get_admin_context()
+        type_id = volume['volume_type_id']
+        replication_info = {}
+        if type_id is not None:
+            replication_info = \
+                self._get_replication_by_volume_type(ctxt, type_id)
+        if replication_info:
+            self._delete_replication_volume(volume, sfaccount,
+                                            **replication_info)
 
         params = {'accountID': sfaccount['accountID']}
         data = self._issue_api_request('ListVolumesForAccount', params)
