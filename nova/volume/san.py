@@ -887,7 +887,6 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         data = self._issue_api_request('StartVolumePairing',
                                        params,
                                        version='6.0')
-                                       #**replication_info)
         result = self._validate_api_response(data)
 
         params = {'volumeID': target_id,
@@ -915,6 +914,7 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         target_id = volume['rep_data']['sf_id']
         LOG.debug('using target id: %s', target_id)
         self._create_volume_pairing(source_id, target_id, replication_info)
+        return secondary_model
 
 
     def create_volume(self, volume):
