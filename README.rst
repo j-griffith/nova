@@ -41,7 +41,7 @@ What the code does for you:
 3. Extracts remote cluster info from replication type extra-specs if present
 4. If not a replicated type, just ignore and do as we've alway done
 5. If the volume is of type "replication":
-  a. Setup cluster pairing between *this* SF Cluster and the specified Remote
-  b. Create a Volume on both *this* SF Cluster and the specified Remote
-  c. Enable Volume-Pairing on the two volumes
+a. Setup cluster pairing between *this* SF Cluster and the specified Remote
+b. Create a Volume on both *this* SF Cluster and the specified Remote
+c. Enable Volume-Pairing on the two volumes
 6. On delete, if the volume is paired, delete on both the source and target SF Clusters
