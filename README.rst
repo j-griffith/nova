@@ -25,10 +25,13 @@ SolidFire Replication Additions
 =============================================
 
 What's included in this branch:
+
 1. Ability to set extra-specs (requires modified novaclient as well: https://github.com/j-griffith/python-novaclient/tree/essex-volume-types-extra-specs)
+
 2. Modified SolidFire driver (san.py) to check for volume-types that include replication info
 
 How it works:
+
 Admin creates a volume-type with extra-specs that denote the remote-replication cluster
     `nova volume-type-create rep replication:mvip=192.168.139.136 replication:login=remote-mvip-login replication:pasword=remot-mvip-password`
 
