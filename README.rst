@@ -37,11 +37,19 @@ User now creates a volume as usual, however can specify a replicated type if the
 
 What the code does for you:
 1. Driver gets the create call as usual
+
 2. Now checks to see if there's a volume-type associated with the Volume
+
 3. Extracts remote cluster info from replication type extra-specs if present
+
 4. If not a replicated type, just ignore and do as we've alway done
+
 5. If the volume is of type "replication":
+
    - Setup cluster pairing between *this* SF Cluster and the specified Remote
+
    - Create a Volume on both *this* SF Cluster and the specified Remote
+
    - Enable Volume-Pairing on the two volumes
+
 6. On delete, if the volume is paired, delete on both the source and target SF Clusters
