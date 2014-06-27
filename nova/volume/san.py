@@ -756,7 +756,8 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
     def _get_sfaccount_by_name(self, sf_account_name, **kwargs):
         sfaccount = None
         params = {'username': sf_account_name}
-        data = self._issue_api_request('GetAccountByName', params, version='1.0', **kwargs)
+        data = self._issue_api_request('GetAccountByName', params,
+                                       version='1.0', **kwargs)
         if 'result' in data and 'account' in data['result']:
             LOG.debug(_('Found solidfire account: %s') % sf_account_name)
             sfaccount = data['result']['account']
@@ -781,14 +782,16 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                       'attributes': {}}
             data = self._issue_api_request('AddAccount', params, **alt_cluster)
             if 'result' in data:
-                sfaccount = self._get_sfaccount_by_name(sf_account_name, **alt_cluster)
+                sfaccount = self._get_sfaccount_by_name(sf_account_name,
+                                                        **alt_cluster)
 
         return sfaccount
 
     def _get_cluster_info(self, **remote_cluster):
         params = {}
 
-        data = self._issue_api_request('GetClusterInfo', params, version='1.0', **remote_cluster)
+        data = self._issue_api_request('GetClusterInfo', params,
+                                       version='1.0', **remote_cluster)
         return self._validate_api_response(data)
 
     def _do_export(self, volume):
@@ -888,18 +891,28 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                                        params,
                                        version='6.0')
         result = self._validate_api_response(data)
+        pairing_key = result['volumePairingKey']
+
+        # Set the dest to target_mode
+        params = {'volumeID': target_id,
+                  'access': 'replicationTarget'}
+
+        data = self._issue_api_request('ModifyVolume',
+                                       params,
+                                       version='6.0',
+                                       **replication_info)
+        result = self._validate_api_response(data)
 
         params = {'volumeID': target_id,
-                  'volumePairingKey': result['volumePairingKey']}
+                  'volumePairingKey': pairing_key}
         data = self._issue_api_request('CompleteVolumePairing',
                                        params,
                                        version='6.0',
                                        **replication_info)
         result = self._validate_api_response(data)
 
-    def _replicate_volume_with_create(self, volume, source_id, replication_info):
-        # First we create the destination volume on the specified cluster
-
+    def _replicate_volume_with_create(self, volume,
+                                      source_id, replication_info):
         # Things we expect in replication_info:
         #   {'mvip': 'ip-addr',
         #    'api_port': 'api_port',
@@ -907,15 +920,17 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
         #    'password': 'password'}
 
         # BOOKMARK
+        LOG.debug('Activate pairing between volume %s and %s' %
+                  (volume['id'], source_id))
         replication_info['volume_name'] = volume['name'] + '-secondary'
         volume['rep_data'] = replication_info
+
+        # First we create the destination volume on the specified cluster
         secondary_model = self.create_volume(volume)
         self._check_enable_cluster_pairing(replication_info)
         target_id = volume['rep_data']['sf_id']
-        LOG.debug('using target id: %s', target_id)
         self._create_volume_pairing(source_id, target_id, replication_info)
         return secondary_model
-
 
     def create_volume(self, volume):
         """Create volume on SolidFire device.
@@ -955,8 +970,8 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
             # don't recurse the type info, we already know that
             # it's a secondary going to a remote Sf cluster
             if not alt_cluster:
-                replication_info  = \
-                self._get_replication_by_volume_type(ctxt, type_id)
+                replication_info = \
+                    self._get_replication_by_volume_type(ctxt, type_id)
 
         if qos:
             for k, v in qos.items():
@@ -984,7 +999,8 @@ class SolidFireSanISCSIDriver(SanISCSIDriver):
                   'attributes': attributes,
                   'qos': qos}
 
-        data = self._issue_api_request('CreateVolume', params, version='1.0', **alt_cluster)
+        data = self._issue_api_request('CreateVolume', params,
+                                       version='1.0', **alt_cluster)
         result = self._validate_api_response(data)
 
         volume_id = result['volumeID']
