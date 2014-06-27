@@ -36,6 +36,7 @@ User now creates a volume as usual, however can specify a replicated type if the
     `nova volume-create --volume_type rep --display_name my-replicated-volume 100`
 
 What the code does for you:
+
 1. Driver gets the create call as usual
 
 2. Now checks to see if there's a volume-type associated with the Volume
