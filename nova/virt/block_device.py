@@ -234,6 +234,7 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
                 self._bdm_obj.connection_info)
         except TypeError:
             self['connection_info'] = None
+        self['attachment_id'] = self._bdm_obj.attachment_id
 
     def _preserve_multipath_id(self, connection_info):
         if self['connection_info'] and 'data' in self['connection_info']:
@@ -242,6 +243,54 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
                     self['connection_info']['data']['multipath_id']
                 LOG.info(_LI('preserve multipath_id %s'),
                          connection_info['data']['multipath_id'])
+
+    @update_db
+    def new_attach(self, context, instance, volume_api, virt_driver,
+               do_check_attach=True, do_driver_attach=False, **kwargs):
+
+        # TODO(jdg): Mostly copy/paste from def attach, refactor out the
+        # driver_attach call and share it?
+        volume = volume_api.get(context, self.volume_id)
+        if do_check_attach:
+            volume_api.check_attach(context, volume, instance=instance)
+
+        volume_id = volume['id']
+        context = context.elevated()
+        connector = virt_driver.get_volume_connector(instance)
+        attachment_ref = volume_api.create_attachment(context,
+                                                      volume_id,
+                                                      connector,
+                                                      instance.uuid,
+                                                      self['mount_device'])
+        self['connection_info'] = attachment_ref
+
+        if 'serial' not in attachment_ref:
+            attachment_ref['serial'] = self.volume_id
+
+        if self.volume_size is None:
+            self.volume_size = volume.get('size')
+
+        self._preserve_multipath_id(attachment_ref)
+        self.save()
+
+        if do_driver_attach:
+            encryption = encryptors.get_encryption_metadata(
+                context, volume_api, volume_id, attachment_ref)
+
+            try:
+                virt_driver.attach_volume(
+                        context, attachment_ref, instance,
+                        self['mount_device'], disk_bus=self['disk_bus'],
+                        device_type=self['device_type'], encryption=encryption)
+            except Exception:
+                with excutils.save_and_reraise_exception():
+                    LOG.exception(_LE("Driver failed to attach volume "
+                                      "%(volume_id)s at %(mountpoint)s"),
+                                  {'volume_id': volume_id,
+                                   'mountpoint': self['mount_device']},
+                                  context=context, instance=instance)
+                    volume_api.remove_attachment(context, volume_id,
+                                                 attachment_ref['id'])
 
     @update_db
     def attach(self, context, instance, volume_api, virt_driver,
@@ -263,6 +312,8 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
 
         # If do_driver_attach is False, we will attach a volume to an instance
         # at boot time. So actual attach is done by instance creation code.
+        # NOTE this is the internal attachment to the instance by the
+        # hypervisor and does not involve additional cinder calls
         if do_driver_attach:
             encryption = encryptors.get_encryption_metadata(
                 context, volume_api, volume_id, connection_info)
@@ -320,6 +371,10 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
                     # happen, the detach request will be ignored.
                     volume_api.detach(context, volume_id)
 
+    def _refresh_connection_info_by_attachment(self, context, volume_api,
+                                               attachment_id):
+        pass
+
     @update_db
     def refresh_connection_info(self, context, instance,
                                 volume_api, virt_driver):
@@ -328,9 +383,15 @@ class DriverVolumeBlockDevice(DriverBlockDevice):
             return
 
         connector = virt_driver.get_volume_connector(instance)
-        connection_info = volume_api.initialize_connection(context,
-                                                           self.volume_id,
-                                                           connector)
+        try:
+            connection_info = (
+                self._refresh_connection_info_by_attachment(
+                    self['attachment_id']))
+        except Exception:
+            connection_info = volume_api.initialize_connection(
+                context,
+                self.volume_id,
+                connector)
         if 'serial' not in connection_info:
             connection_info['serial'] = self.volume_id
         self._preserve_multipath_id(connection_info)

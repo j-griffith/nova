@@ -6693,6 +6693,10 @@ class LibvirtDriver(driver.ComputeDriver):
         connector = self.get_volume_connector(instance)
         volume_api = self._volume_api
         for vol in block_device_mapping:
+            # FIXME(jdg): Should implement/use a Cinder get_connection_info
+            # method for this sort of thing instead of dual purposing the
+            # initialize_connection call
+
             # Retrieve connection info from Cinder's initialize_connection API.
             # The info returned will be accurate for the source server.
             volume_id = vol['connection_info']['serial']

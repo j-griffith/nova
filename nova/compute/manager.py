@@ -4658,8 +4658,17 @@ class ComputeManager(manager.Manager):
                   'mountpoint': bdm['mount_device']},
                  context=context, instance=instance)
         try:
-            bdm.attach(context, instance, self.volume_api, self.driver,
-                       do_check_attach=False, do_driver_attach=True)
+            if self.volume_api.supports_new_attach(context):
+                bdm.new_attach(context,
+                               instance,
+                               self.volume_api,
+                               self.driver,
+                               do_check_attach=False,
+                               do_driver_attach=True)
+            else:
+                bdm.attach(context, instance, self.volume_api, self.driver,
+                           do_check_attach=False, do_driver_attach=True)
+
         except Exception:
             with excutils.save_and_reraise_exception():
                 LOG.exception(_LE("Failed to attach %(volume_id)s "

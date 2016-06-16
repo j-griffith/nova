@@ -3030,10 +3030,30 @@ class API(base.Base):
             device_type=device_type, is_local_creation=True)
         try:
             self._check_attach_and_reserve_volume(context, volume_id, instance)
-            self.volume_api.attach(context,
-                                   volume_id,
-                                   instance.uuid,
-                                   device)
+
+            # FIXME(jdg): Sort this out with microversions if/when they're
+            # ready in the cinder client etc
+            if not self.volume_api.supports_new_attach(context):
+                self.volume_api.attach(context,
+                                       volume_id,
+                                       instance.uuid,
+                                       device)
+            else:
+                # We don't have an actual connection, that's ok, set
+                # this as a no-connect and we can update/modify the
+                # attachment on unshelve
+                empty_connector = {'host': 'unknown'}
+                empty_mountpoint = ""
+                attachment_ref = self.volume_api.create_attachment(
+                    context,
+                    volume_id,
+                    empty_connector,
+                    instance.uuid,
+                    empty_mountpoint,
+                    no_connect=True)
+                volume_bdm['connection_info']['attachment_id'] = attachment_ref['attachment_id']
+                volume_bdm.save()
+
         except Exception:
             with excutils.save_and_reraise_exception():
                 volume_bdm.destroy()

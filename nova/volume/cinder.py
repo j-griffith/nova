@@ -180,6 +180,21 @@ def _untranslate_snapshot_summary_view(context, snapshot):
     return d
 
 
+def _untranslate_attachment_summary_view(context, attachment):
+    """Maps keys for attachment summary view."""
+    d = {}
+    d['id'] = attachment.id
+    d['volume_id'] = attachment.id
+    d['instance_uuid'] = attachment.instance_uuid
+    d['attached_host'] = attachment.attached_host
+    d['mountpoint'] = attachment.mountpoint
+    d['attach_time'] = attachment.attach_time
+    d['detach_time'] = attachment.detach_time
+    d['attach_status'] = attachment.attach_status
+    d['attach_mode'] = attachment.attach_mode
+    return d
+
+
 def translate_cinder_exception(method):
     """Transforms a cinder exception but keeps its traceback intact."""
     @functools.wraps(method)
@@ -513,3 +528,60 @@ class API(object):
             {'status': status,
              'progress': '90%'}
         )
+
+    @translate_volume_exception
+    def create_attachment(self, context, volume_id, connector, instance_uuid,
+                          mountpoint, no_connect=False):
+        try:
+            attachment_info = cinderclient(
+                context).volumes.create_attachment(volume_id, connector,
+                                                   instance_uuid, mountpoint,
+                                                   no_connect=no_connect)
+        except cinder_exception.ClientException as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE('Create attachment failed for volume '
+                              'on host %(host)s. Error: %(msg)s '
+                              'Code: %(code)s.'),
+                          {'host': connector.get('host'),
+                           'msg': six.text_type(ex),
+                           'code': ex.code},
+                          resource={'type': 'volume',
+                                    'id': volume_id})
+        return attachment_info
+
+    @translate_volume_exception
+    def remove_attachment(self, context, volume_id, connector, instance_uuid,
+                          mountpoint):
+        try:
+            remaining_attachments = cinderclient(
+                context).volumes.remove_attachment(volume_id, connector,
+                                                   instance_uuid, mountpoint)
+        except cinder_exception.ClientException as ex:
+            with excutils.save_and_reraise_exception():
+                LOG.error(_LE('Remove attachment failed for volume '
+                              'on host %(host)s. Error: %(msg)s '
+                              'Code: %(code)s.'),
+                          {'host': connector.get('host'),
+                           'msg': six.text_type(ex),
+                           'code': ex.code},
+                          resource={'type': 'volume',
+                                    'id': volume_id})
+        rval = []
+        for item in remaining_attachments:
+            rval.append(_untranslate_attachment_summary_view(context, item))
+        return rval
+
+    @translate_volume_exception
+    def list_attachments(self, context, volume_id, host=None):
+        attachment_refs = (
+            cinderclient(context).volumes.list_attachments(
+                volume_id,
+                host_filter=host))
+        rval = []
+        for item in attachment_refs:
+            rval.append(_untranslate_attachment_summary_view(context, item))
+        return rval
+
+    def supports_new_attach(self, context):
+        # FIXME(jdg): Obviously need a formal check here
+        return True
